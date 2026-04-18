@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------
+# device.yaml
+# Drop-in starter for a LumaDeck consumer repo. Defaults to the
+# LilyGo T-Display-S3 AMOLED hardware. Swap the display/touch blocks
+# at the bottom for your panel.
+#
+# Assumes LumaDeck is checked out at `./lumadeck/` (as a git
+# submodule). If you cloned it somewhere else, update the !include
+# paths.
+# ---------------------------------------------------------------
+
+substitutions:
+  device_name:      "my_panel"
+  device_friendly:  "My Panel"
+  ha_media_player:  "media_player.living_room"
+
+packages:
+  core:    !include lumadeck/packages/core.yaml
+  board:   !include lumadeck/packages/board_esp32s3.yaml
+  theme:   !include lumadeck/themes/dark.yaml
+  fonts:   !include lumadeck/packages/fonts.yaml
+  colors:  !include lumadeck/packages/colors.yaml
+  display: !include lumadeck/packages/display.yaml
+  ha:      !include lumadeck/packages/ha.yaml
+  nav:     !include lumadeck/packages/nav.yaml
+  touch:   !include lumadeck/packages/touch.yaml
+  # Portrait native (240x536). Landscape (wide_536x240.yaml) is
+  # blocked on figuring out the right LVGL+qspi_dbi rotation syntax —
+  # see LumaDeck's todo.md §11.
+  layout:  !include lumadeck/layouts/tall_240x536.yaml
+  status:  !include lumadeck/widgets/status_bar.yaml
+  clock:   !include lumadeck/widgets/clock.yaml
+  navtabs: !include lumadeck/widgets/nav_tabs.yaml
+  media:   !include lumadeck/widgets/media_card.yaml
+  toast:   !include lumadeck/widgets/notification_toast.yaml
+
+# ---- hardware (LilyGo T-Display-S3 AMOLED 1.91" touch version) ----
+# Pin map from
+# https://github.com/Xinyuan-LilyGO/LilyGo-AMOLED-Series/blob/master/src/LilyGo_AMOLED.h
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+  variant: ESP32S3
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+spi:
+  - id: lcd_qspi
+    type: quad
+    clk_pin: GPIO47
+    data_pins: [GPIO18, GPIO7, GPIO48, GPIO5]
+
+display:
+  - platform: qspi_dbi
+    id: lum_display
+    model: RM67162
+    spi_id: lcd_qspi
+    cs_pin: GPIO6
+    reset_pin: GPIO17
+    enable_pin: GPIO38
+    dimensions:
+      width: 240
+      height: 536
+    auto_clear_enabled: false
+    update_interval: never
+
+# Bind display to LVGL. Rotation is a known follow-up.
+lvgl:
+  displays:
+    - lum_display
+
+i2c:
+  - id: bus_a
+    sda: GPIO3
+    scl: GPIO2
+    frequency: 400kHz
+
+touchscreen:
+  - platform: cst816
+    id: lum_touchscreen
+    i2c_id: bus_a
+    interrupt_pin: GPIO21
+    on_touch:
+      - script.execute: touch_mark_active
+
+binary_sensor:
+  - platform: gpio
+    id: lum_boot_btn
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - script.execute: nav_next_page
+
+sensor:
+  - platform: adc
+    id: lum_bat_voltage
+    pin: GPIO4
+    name: "${device_friendly} Battery Voltage"
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      - multiply: 2.0

@@ -1,0 +1,3 @@
+[submodule "lumadeck"]
+	path = lumadeck
+	url = https://github.com/shotah/LumaDeck
