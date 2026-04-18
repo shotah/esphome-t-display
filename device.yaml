@@ -24,10 +24,9 @@ packages:
   ha:      !include lumadeck/packages/ha.yaml
   nav:     !include lumadeck/packages/nav.yaml
   touch:   !include lumadeck/packages/touch.yaml
-  # Portrait native (240x536). Landscape (wide_536x240.yaml) is
-  # blocked on figuring out the right LVGL+qspi_dbi rotation syntax —
-  # see LumaDeck's todo.md §11.
-  layout:  !include lumadeck/layouts/tall_240x536.yaml
+  # Landscape (default). Switch to tall_240x536.yaml + remove the
+  # `rotation: 90` line on the lvgl: block at the bottom for portrait.
+  layout:  !include lumadeck/layouts/wide_536x240.yaml
   status:  !include lumadeck/widgets/status_bar.yaml
   clock:   !include lumadeck/widgets/clock.yaml
   navtabs: !include lumadeck/widgets/nav_tabs.yaml
@@ -69,8 +68,10 @@ display:
     auto_clear_enabled: false
     update_interval: never
 
-# Bind display to LVGL. Rotation is a known follow-up.
+# Bind display to LVGL and rotate to landscape (LVGL auto-rotates
+# touchscreen coords too).
 lvgl:
+  rotation: 90
   displays:
     - lum_display
 
@@ -85,8 +86,23 @@ touchscreen:
     id: lum_touchscreen
     i2c_id: bus_a
     interrupt_pin: GPIO21
+    # Swipe-left / swipe-right pages via packages/touch.yaml.
     on_touch:
-      - script.execute: touch_mark_active
+      - script.execute:
+          id: lum_touch_press
+          x: !lambda 'return touch.x;'
+          y: !lambda 'return touch.y;'
+    on_update:
+      - if:
+          condition:
+            lambda: 'return !touches.empty();'
+          then:
+            - script.execute:
+                id: lum_touch_update
+                x: !lambda 'return touches[0].x;'
+                y: !lambda 'return touches[0].y;'
+    on_release:
+      - script.execute: lum_touch_release
 
 binary_sensor:
   - platform: gpio
