@@ -1,0 +1,507 @@
+# ---------------------------------------------------------------
+# waveshare-1.85c.yaml
+#
+# LumaDeck consumer YAML for the Waveshare ESP32-S3-Touch-LCD-1.85C
+# (BOX speaker + 3.7V Li battery variant).
+#
+#   Product: https://www.waveshare.com/esp32-s3-touch-lcd-1.85c.htm
+#   Wiki:    https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-1.85C
+#
+# Hardware highlights:
+#   * 1.85" 360x360 round AMOLED, ST77916 over QSPI
+#   * CST816 capacitive touch over I2C
+#   * TCA9554PWR I2C GPIO expander (LCD_RST=EXIO2, TP_RST=EXIO1)
+#   * PCM5101 I2S DAC + 4Ω 5W speaker (BOX variant)
+#   * PCF85063 RTC, QMI8658 IMU, microphone, TF slot (not wired here)
+#
+# IMPORTANT — first-light status:
+# As of ESPHome 2026.04, ST77916 is NOT a built-in qspi_dbi model
+# (https://github.com/esphome/feature-requests/issues/2803), so we
+# use `model: CUSTOM` with a hand-transcribed `init_sequence:`.
+#
+# Source of truth for everything board-specific (init bytes, polarity,
+# pin numbering, SPI clock, color order) is Waveshare's own
+# Arduino/ESP-IDF reference firmware, vendored as a submodule at:
+#   references/waveshare-esp32-s3-touch-lcd-1.85c/
+# See `references/README.md` for which files matter.
+#
+# Specifically: the init bytes below come from
+#   Arduino/examples/01_lvgl_example/Display_ST77916.cpp ::
+#     vendor_specific_init_new[]
+# (NOT from Espressif's generic `vendor_specific_init_default[]`).
+# Waveshare's panel ships in at least two revisions and they detect
+# which by reading chip register 0x04 at boot. ESPHome can't do
+# runtime detection from YAML, so we pick the newer-revision
+# sequence -- which is what any board manufactured 2025+ uses.
+# ---------------------------------------------------------------
+
+substitutions:
+  device_name:      "waveshare_round"
+  device_friendly:  "Waveshare 1.85 Round"
+  ha_media_player:  "media_player.living_room"
+  # Bumped to DEBUG during first-light bring-up so the boot log shows
+  # PSRAM init, the I2C device scan (we need to see 0x20 for the
+  # TCA9554), the qspi_dbi init bytes, and LVGL framebuffer alloc.
+  # Drop back to INFO once the panel lights up.
+  log_level:        "DEBUG"
+  # Pin substitutions consumed by lumadeck/packages/{backlight,audio}.yaml
+  backlight_pin:    "GPIO5"
+  audio_dout_pin:   "GPIO47"
+
+packages:
+  core:      !include lumadeck/packages/core.yaml
+  board:     !include lumadeck/packages/board_esp32s3.yaml
+  theme:     !include lumadeck/themes/dark.yaml
+  fonts:     !include lumadeck/packages/fonts.yaml
+  colors:    !include lumadeck/packages/colors.yaml
+  display:   !include lumadeck/packages/display.yaml
+  ha:        !include lumadeck/packages/ha.yaml
+  nav:       !include lumadeck/packages/nav.yaml
+  touch:     !include lumadeck/packages/touch.yaml
+  backlight: !include lumadeck/packages/backlight.yaml
+  audio:     !include lumadeck/packages/audio.yaml
+  layout:    !include lumadeck/layouts/round_360.yaml
+  status:    !include lumadeck/widgets/status_bar.yaml
+  clock:     !include lumadeck/widgets/clock.yaml
+  navtabs:   !include lumadeck/widgets/nav_tabs.yaml
+  # media: TEMPORARILY DISABLED for first-light debug. The media_card
+  # widget subscribes to multiple HA media_player state attributes;
+  # when wifi/API come up, HA pushes state which triggers a flurry
+  # of `lvgl.label.update` / `lvgl.slider.update` actions. Each one
+  # makes LVGL flush via qspi_dbi to the ST77916. If the panel isn't
+  # responding (which is consistent with the screen being blank),
+  # the SPI/DMA flush hangs the main loop -- exactly matching the
+  # observed freeze-after-wifi-connect symptom. Re-enable once the
+  # display is verified to be talking to us.
+  # media:     !include lumadeck/widgets/media_card.yaml
+  toast:     !include lumadeck/widgets/notification_toast.yaml
+  chime:     !include lumadeck/widgets/notification_sound.yaml
+
+# ---- hardware (lives in this consumer repo, not in LumaDeck) ----
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+  variant: ESP32S3
+
+# The Waveshare 1.85C wires its USB-C port directly to the ESP32-S3's
+# built-in USB-Serial/JTAG peripheral (GPIO19/20) -- there is NO
+# CH340/CP2102 bridge on the board. Default ESPHome logging targets
+# UART0 (GPIO43/44, side header only), which means nothing reaches
+# the USB-C cable. Override the logger to route over the JTAG/CDC
+# device so `make waveshare-logs` actually shows boot output.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: ${log_level}
+
+# 8MB octal PSRAM — required for the 360x360 LVGL framebuffer.
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Single I2C bus shared by the TCA9554 expander, CST816 touch,
+# PCF85063 RTC, and any future expander-side peripherals. Per the
+# Waveshare wiki SCL/SDA on this board are dedicated I2C pins and
+# cannot be remapped to GPIO.
+i2c:
+  - id: bus_a
+    sda: GPIO11
+    scl: GPIO10
+    frequency: 400kHz
+    scan: true
+
+# TCA9554PWR GPIO expander. Drives the panel reset (EXIO2) and touch
+# reset (EXIO1) lines. SD card CS (EXIO3) and RTC INT (EXIO4) are
+# present on the bus but not wired here.
+#
+# ESPHome's `pca9554` platform handles both PCA9554 and TCA9554
+# (identical command interface) -- there is no separate `tca9554:`
+# component as of ESPHome 2026.04.
+pca9554:
+  - id: lum_io_expander
+    address: 0x20
+    i2c_id: bus_a
+
+# QSPI bus for the ST77916 AMOLED.
+spi:
+  - id: lcd_qspi
+    type: quad
+    clk_pin: GPIO40
+    data_pins:
+      - GPIO46    # D0 / SDA0
+      - GPIO45    # D1 / SDA1
+      - GPIO42    # D2 / SDA2
+      - GPIO41    # D3 / SDA3
+
+display:
+  - platform: qspi_dbi
+    id: lum_display
+    model: CUSTOM
+    spi_id: lcd_qspi
+    cs_pin: GPIO21
+    # LCD_RST is on EXIO2 of the TCA9554 — not a GPIO. ESPHome's
+    # qspi_dbi will toggle it through the expander (the pca9554
+    # platform covers TCA9554 too).
+    reset_pin:
+      pca9554: lum_io_expander
+      number: 2
+      mode:
+        output: true
+      inverted: true
+    dimensions:
+      width: 360
+      height: 360
+    # Color order RGB and 80 MHz pclk both lifted from
+    # references/.../Display_ST77916.{cpp,h}:
+    #   .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+    #   ESP_PANEL_LCD_SPI_CLK_HZ = 80 * 1000 * 1000;
+    color_order: rgb
+    invert_colors: false
+    data_rate: 80MHz
+    auto_clear_enabled: false
+    update_interval: never
+    # ----------------------------------------------------------
+    # Vendor-specific init sequence for ST77916, lifted verbatim
+    # from Waveshare's own working Arduino reference firmware:
+    #   references/waveshare-esp32-s3-touch-lcd-1.85c/
+    #     Arduino/examples/01_lvgl_example/Display_ST77916.cpp
+    #   :: vendor_specific_init_new[]
+    #
+    # Their code reads chip register 0x04 at boot to pick between
+    # this sequence and Espressif's `vendor_specific_init_default[]`.
+    # We can't probe at YAML config-time, so we pick this one --
+    # it's the sequence for the panel revision shipping in 2025+
+    # boards, which is what we have. Each `- [CMD, ...DATA]`
+    # corresponds to one `{cmd, data, size, delay_ms}` struct entry;
+    # non-zero delay_ms entries become a `- delay <n>ms` line.
+    # ----------------------------------------------------------
+    init_sequence:
+      - [0xF0, 0x28]
+      - [0xF2, 0x28]
+      - [0x73, 0xF0]
+      - [0x7C, 0xD1]
+      - [0x83, 0xE0]
+      - [0x84, 0x61]
+      - [0xF2, 0x82]
+      - [0xF0, 0x00]
+      - [0xF0, 0x01]
+      - [0xF1, 0x01]
+      - [0xB0, 0x56]
+      - [0xB1, 0x4D]
+      - [0xB2, 0x24]
+      - [0xB4, 0x87]
+      - [0xB5, 0x44]
+      - [0xB6, 0x8B]
+      - [0xB7, 0x40]
+      - [0xB8, 0x86]
+      - [0xBA, 0x00]
+      - [0xBB, 0x08]
+      - [0xBC, 0x08]
+      - [0xBD, 0x00]
+      - [0xC0, 0x80]
+      - [0xC1, 0x10]
+      - [0xC2, 0x37]
+      - [0xC3, 0x80]
+      - [0xC4, 0x10]
+      - [0xC5, 0x37]
+      - [0xC6, 0xA9]
+      - [0xC7, 0x41]
+      - [0xC8, 0x01]
+      - [0xC9, 0xA9]
+      - [0xCA, 0x41]
+      - [0xCB, 0x01]
+      - [0xD0, 0x91]
+      - [0xD1, 0x68]
+      - [0xD2, 0x68]
+      - [0xF5, 0x00, 0xA5]
+      - [0xDD, 0x4F]
+      - [0xDE, 0x4F]
+      - [0xF1, 0x10]
+      - [0xF0, 0x00]
+      - [0xF0, 0x02]
+      - [0xE0, 0xF0, 0x0A, 0x10, 0x09, 0x09, 0x36, 0x35, 0x33, 0x4A, 0x29, 0x15, 0x15, 0x2E, 0x34]
+      - [0xE1, 0xF0, 0x0A, 0x0F, 0x08, 0x08, 0x05, 0x34, 0x33, 0x4A, 0x39, 0x15, 0x15, 0x2D, 0x33]
+      - [0xF0, 0x10]
+      - [0xF3, 0x10]
+      - [0xE0, 0x07]
+      - [0xE1, 0x00]
+      - [0xE2, 0x00]
+      - [0xE3, 0x00]
+      - [0xE4, 0xE0]
+      - [0xE5, 0x06]
+      - [0xE6, 0x21]
+      - [0xE7, 0x01]
+      - [0xE8, 0x05]
+      - [0xE9, 0x02]
+      - [0xEA, 0xDA]
+      - [0xEB, 0x00]
+      - [0xEC, 0x00]
+      - [0xED, 0x0F]
+      - [0xEE, 0x00]
+      - [0xEF, 0x00]
+      - [0xF8, 0x00]
+      - [0xF9, 0x00]
+      - [0xFA, 0x00]
+      - [0xFB, 0x00]
+      - [0xFC, 0x00]
+      - [0xFD, 0x00]
+      - [0xFE, 0x00]
+      - [0xFF, 0x00]
+      - [0x60, 0x40]
+      - [0x61, 0x04]
+      - [0x62, 0x00]
+      - [0x63, 0x42]
+      - [0x64, 0xD9]
+      - [0x65, 0x00]
+      - [0x66, 0x00]
+      - [0x67, 0x00]
+      - [0x68, 0x00]
+      - [0x69, 0x00]
+      - [0x6A, 0x00]
+      - [0x6B, 0x00]
+      - [0x70, 0x40]
+      - [0x71, 0x03]
+      - [0x72, 0x00]
+      - [0x73, 0x42]
+      - [0x74, 0xD8]
+      - [0x75, 0x00]
+      - [0x76, 0x00]
+      - [0x77, 0x00]
+      - [0x78, 0x00]
+      - [0x79, 0x00]
+      - [0x7A, 0x00]
+      - [0x7B, 0x00]
+      - [0x80, 0x48]
+      - [0x81, 0x00]
+      - [0x82, 0x06]
+      - [0x83, 0x02]
+      - [0x84, 0xD6]
+      - [0x85, 0x04]
+      - [0x86, 0x00]
+      - [0x87, 0x00]
+      - [0x88, 0x48]
+      - [0x89, 0x00]
+      - [0x8A, 0x08]
+      - [0x8B, 0x02]
+      - [0x8C, 0xD8]
+      - [0x8D, 0x04]
+      - [0x8E, 0x00]
+      - [0x8F, 0x00]
+      - [0x90, 0x48]
+      - [0x91, 0x00]
+      - [0x92, 0x0A]
+      - [0x93, 0x02]
+      - [0x94, 0xDA]
+      - [0x95, 0x04]
+      - [0x96, 0x00]
+      - [0x97, 0x00]
+      - [0x98, 0x48]
+      - [0x99, 0x00]
+      - [0x9A, 0x0C]
+      - [0x9B, 0x02]
+      - [0x9C, 0xDC]
+      - [0x9D, 0x04]
+      - [0x9E, 0x00]
+      - [0x9F, 0x00]
+      - [0xA0, 0x48]
+      - [0xA1, 0x00]
+      - [0xA2, 0x05]
+      - [0xA3, 0x02]
+      - [0xA4, 0xD5]
+      - [0xA5, 0x04]
+      - [0xA6, 0x00]
+      - [0xA7, 0x00]
+      - [0xA8, 0x48]
+      - [0xA9, 0x00]
+      - [0xAA, 0x07]
+      - [0xAB, 0x02]
+      - [0xAC, 0xD7]
+      - [0xAD, 0x04]
+      - [0xAE, 0x00]
+      - [0xAF, 0x00]
+      - [0xB0, 0x48]
+      - [0xB1, 0x00]
+      - [0xB2, 0x09]
+      - [0xB3, 0x02]
+      - [0xB4, 0xD9]
+      - [0xB5, 0x04]
+      - [0xB6, 0x00]
+      - [0xB7, 0x00]
+      - [0xB8, 0x48]
+      - [0xB9, 0x00]
+      - [0xBA, 0x0B]
+      - [0xBB, 0x02]
+      - [0xBC, 0xDB]
+      - [0xBD, 0x04]
+      - [0xBE, 0x00]
+      - [0xBF, 0x00]
+      - [0xC0, 0x10]
+      - [0xC1, 0x47]
+      - [0xC2, 0x56]
+      - [0xC3, 0x65]
+      - [0xC4, 0x74]
+      - [0xC5, 0x88]
+      - [0xC6, 0x99]
+      - [0xC7, 0x01]
+      - [0xC8, 0xBB]
+      - [0xC9, 0xAA]
+      - [0xD0, 0x10]
+      - [0xD1, 0x47]
+      - [0xD2, 0x56]
+      - [0xD3, 0x65]
+      - [0xD4, 0x74]
+      - [0xD5, 0x88]
+      - [0xD6, 0x99]
+      - [0xD7, 0x01]
+      - [0xD8, 0xBB]
+      - [0xD9, 0xAA]
+      - [0xF3, 0x01]
+      - [0xF0, 0x00]
+      - [0x21, 0x00]
+      - [0x11, 0x00]
+      - delay 120ms
+      - [0x29, 0x00]
+
+# Backlight + I2S speaker sink are now supplied by:
+#   lumadeck/packages/backlight.yaml  (consumes ${backlight_pin})
+#   lumadeck/packages/audio.yaml      (consumes ${audio_dout_pin})
+# See substitutions block at the top of this file.
+
+# Bind the display to LVGL. The 360x360 panel is square so no
+# rotation is needed (round_360 layout assumes this orientation).
+lvgl:
+  displays:
+    - lum_display
+
+touchscreen:
+  - platform: cst816
+    id: lum_touchscreen
+    i2c_id: bus_a
+    interrupt_pin: GPIO4
+    # TP_RST is also on the TCA9554 (EXIO1).
+    reset_pin:
+      pca9554: lum_io_expander
+      number: 1
+      mode:
+        output: true
+      inverted: true
+    on_touch:
+      - script.execute:
+          id: lum_touch_press
+          x: !lambda 'return touch.x;'
+          y: !lambda 'return touch.y;'
+    on_update:
+      - if:
+          condition:
+            lambda: 'return !touches.empty();'
+          then:
+            - script.execute:
+                id: lum_touch_update
+                x: !lambda 'return touches[0].x;'
+                y: !lambda 'return touches[0].y;'
+    on_release:
+      - script.execute: lum_touch_release
+
+# Boot button doubles as manual page-cycle, matching the LilyGo build.
+# During first-light bring-up it ALSO fires the chime, so we have an
+# audible signal that's independent of the display: if the screen is
+# black but pressing GPIO0 makes the speaker beep, we know the device
+# booted, the I2C bus came up, and component setup completed -- the
+# bug is then narrowly in display land. Drop the `lum_notify_chime`
+# action once the panel is lit.
+binary_sensor:
+  - platform: gpio
+    id: lum_boot_btn
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - logger.log: "[boot_btn] pressed -> nav_next_page + lum_notify_chime"
+      - script.execute: nav_next_page
+      - script.execute: lum_notify_chime
+
+# I2S audio bus (PCM5101 DAC). The `speaker:` sink (id `lum_speaker`)
+# is supplied by lumadeck/packages/audio.yaml; we only declare the
+# bus + pin map here, same split LumaDeck uses for `i2c:` / `spi:`.
+# Pins from the Waveshare wiki:
+#   Speak_DIN  = GPIO47   (audio_dout_pin substitution)
+#   Speak_LRCK = GPIO38
+#   Speak_BCK  = GPIO48
+i2s_audio:
+  - id: lum_i2s
+    i2s_lrclk_pin: GPIO38
+    i2s_bclk_pin: GPIO48
+
+# Power-amplifier ENABLE pin on GPIO15. Without this driven HIGH, the
+# PCM5101 will output audio fine but the analog amp downstream is in
+# shutdown -- you'll see ESPHome log "Started -> Stopped" on the
+# speaker but hear NOTHING. Discovered from Waveshare's reference
+# firmware:
+#   references/.../ESP-IDF/.../main/Audio_Driver/Audio_Driver.c
+#   :: Audio_PA_EN() / Audio_PA_DIS()
+# Their code keeps it LOW at boot and toggles HIGH just before each
+# play; we leave it ALWAYS_ON for simplicity since there's nothing
+# else competing for power on GPIO15. Pulse-mute it later if power
+# draw matters for battery operation.
+switch:
+  - platform: gpio
+    pin: GPIO15
+    id: lum_audio_pa_enable
+    name: "${device_friendly} Audio Amp"
+    restore_mode: ALWAYS_ON
+
+# Periodic heartbeat -- fires every 1s during first-light debug so we
+# can pinpoint within ~1 second when (and if) the main loop wedges.
+# Bump back to 5s once first-light works.
+interval:
+  - interval: 1s
+    then:
+      - logger.log:
+          level: INFO
+          format: "[heartbeat] uptime=%us  free_heap=%uKB  api=%s"
+          args:
+            - "(unsigned)(millis() / 1000)"
+            - "(unsigned)(esp_get_free_heap_size() / 1024)"
+            - 'api_is_connected() ? "UP" : "down"'
+
+# First-light heartbeat: every successful boot fires the chime once,
+# at the very end of setup (after wifi/api/components are all up).
+# If you hear a beep, the device is alive even when the panel is
+# black -- isolates display issues from system-wide failures.
+# Remove (or set priority back to 600+) once the panel is lit.
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      - delay: 2s
+      - logger.log: "[on_boot] firing boot chime now -- listen for a beep"
+      - script.execute: lum_notify_chime
+      - delay: 200ms
+      - logger.log: "[on_boot] boot chime done; if you didn't hear it, the PA enable on GPIO15 isn't working"
+
+# Instrumented wifi.on_connect to pinpoint the hang.
+# We saw: heartbeats fire 1Hz from uptime=4..14s, then wifi connects,
+# then SILENCE -- no uptime=15s heartbeat. Something fires once
+# wifi-connect completes and wedges the main loop. These delayed log
+# lines, combined with the 1s heartbeat, will narrow the window:
+#   * If we see all 5 callback logs AND heartbeats keep coming after
+#     -> hang is in some other component triggered after on_connect
+#   * If we see N callback logs then nothing -> hang is between
+#     callback step N and N+1
+#   * If we see 0 callback logs -> hang fires before on_connect runs
+wifi:
+  on_connect:
+    - logger.log: "[wifi.on_connect T+0ms] entered callback"
+    - delay: 50ms
+    - logger.log: "[wifi.on_connect T+50ms] still alive"
+    - delay: 200ms
+    - logger.log: "[wifi.on_connect T+250ms] still alive"
+    - delay: 1s
+    - logger.log: "[wifi.on_connect T+1250ms] still alive"
+    - delay: 2s
+    - logger.log: "[wifi.on_connect T+3250ms] still alive"
+  on_disconnect:
+    - logger.log: "[wifi.on_disconnect] fired"
